@@ -512,11 +512,45 @@ func (d *localDirectory) Readlink(name path.Component) (string, error) {
 }
 
 func (d *localDirectory) Remove(name path.Component) error {
-	fpath, err := getPathFromHandle(d.handle)
+	isDir := false
+	var handle windows.Handle
+	err := ntCreateFile(&handle, windows.DELETE, d.handle, name.String(),
+		windows.FILE_OPEN, windows.FILE_OPEN_REPARSE_POINT|windows.FILE_NON_DIRECTORY_FILE)
 	if err != nil {
-		return err
+		if err == syscall.EISDIR {
+			isDir = true
+		} else {
+			return err
+		}
 	}
-	return os.Remove(filepath.Join(fpath, name.String()))
+	if isDir {
+		err = ntCreateFile(&handle, windows.FILE_GENERIC_READ|windows.DELETE, d.handle, name.String(),
+			windows.FILE_OPEN, windows.FILE_OPEN_REPARSE_POINT)
+		if err != nil {
+			return err
+		}
+		isReparsePoint, _, err := isReparsePointByHandle(handle)
+		if err != nil {
+			return err
+		}
+		if !isReparsePoint {
+			names, err := readdirnames(handle)
+			if err != nil {
+				return err
+			}
+			if len(names) != 0 {
+				return syscall.ENOTEMPTY
+			}
+		}
+	}
+	defer windows.CloseHandle(handle)
+	fileDispInfo := windowsext.FILE_DISPOSITION_INFORMATION_EX{
+		Flags: windows.FILE_DISPOSITION_DELETE | windows.FILE_DISPOSITION_POSIX_SEMANTICS,
+	}
+	var iosb windows.IO_STATUS_BLOCK
+	err = windows.NtSetInformationFile(handle, &iosb, (*byte)(unsafe.Pointer(&fileDispInfo)),
+		uint32(unsafe.Sizeof(fileDispInfo)), windows.FileDispositionInformationEx)
+	return err
 }
 
 // On NTFS mount point is a reparse point, no need to unmount.
@@ -554,12 +588,19 @@ func (d *localDirectory) RemoveAllChildren() error {
 
 func (d *localDirectory) RemoveAll(name path.Component) error {
 	defer runtime.KeepAlive(d)
-	fpath, err := getPathFromHandle(d.handle)
-	if err != nil {
+
+	if subdirectory, err := d.EnterDirectory(name); err == nil {
+		err := subdirectory.RemoveAllChildren()
+		subdirectory.Close()
+		if err != nil {
+			return err
+		}
+		return d.Remove(name)
+	} else if err == syscall.ENOTDIR {
+		return d.Remove(name)
+	} else {
 		return err
 	}
-	fpath = filepath.Join(fpath, name.String())
-	return os.RemoveAll(fpath)
 }
 
 func (d *localDirectory) Rename(oldName path.Component, newDirectory Directory, newName path.Component) error {
@@ -769,7 +810,14 @@ func createNTFSHardlink(oldHandle windows.Handle, oldName string, newHandle wind
 	np, _ := getPathFromHandle(newHandle)
 	op = filepath.Join(op, oldName)
 	np = filepath.Join(np, newName)
-	return os.Link(op, np)
+	err := os.Link(op, np)
+	if err != nil {
+		err = os.Copy(op, np)
+	}
+	if err == nil {
+		os.Chmod(np, 0777)
+	}
+	return err
 }
 
 func renameHelper(sourceHandle, newHandle windows.Handle, newName string) (areSame bool, err error) {
