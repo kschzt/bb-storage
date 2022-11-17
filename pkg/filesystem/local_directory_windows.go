@@ -812,7 +812,7 @@ func createNTFSHardlink(oldHandle windows.Handle, oldName string, newHandle wind
 	np = filepath.Join(np, newName)
 	err := os.Link(op, np)
 	if err != nil {
-		err = os.Copy(op, np)
+		err = iocopy(op, np)
 	}
 	if err == nil {
 		os.Chmod(np, 0777)
@@ -934,6 +934,34 @@ func getPathFromHandle(handle windows.Handle) (string, error) {
 	}
 	var dirp = syscall.UTF16ToString(buf)
 	return dirp, nil
+}
+
+func iocopy(src, dst string) error {
+	sourceFileStat, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+
+	if !sourceFileStat.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", src)
+	}
+
+	source, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+
+	destination, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destination.Close()
+	nBytes, err := io.Copy(destination, source)
+	if nBytes == 0 {
+		return fmt.Errorf("0 bytes copied to %s", dst)
+	}
+	return err
 }
 
 func (d *localDirectory) Apply(arg interface{}) error {
